@@ -3,8 +3,10 @@
 import { requireAdmin } from "@/lib/auth/admin";
 import { supabaseAdmin } from "@/lib/supabase/admin";
 import { revalidatePath } from "next/cache";
+import { validateCsrfToken, CSRF_CONSTANTS } from "@/lib/csrf-server";
+import { checkServerActionRateLimit, SERVER_ACTION_RATE_LIMITS } from "@/lib/rate-limit";
 
-export type AllowedUserRole = "admin" | "judge" | "staff" | "participant" | "leader";
+export type AllowedUserRole = "admin" | "judge" | "staff" | "spoc" | "participant" | "leader";
 
 export interface UserProfileItem {
   id: string;
@@ -14,6 +16,7 @@ export interface UserProfileItem {
   created_at: string;
   team_name?: string | null;
   team_role?: string | null;
+  username?: string | null;
 }
 
 export interface MemberHierarchyItem {
@@ -182,42 +185,57 @@ export async function getUsersList(params?: {
       return [];
     }
 
-    // Fetch team memberships for team name display
+    // Fetch team memberships and auth users metadata in parallel
     const userIds = profiles.map((p) => p.id);
-  const { data: teamMembers } = await supabaseAdmin
-    .from("team_members")
-    .select(`
-      user_id,
-      role,
-      teams (
-        name,
-        code
-      )
-    `)
-    .in("user_id", userIds);
+    const [teamMembersRes, authUsersRes] = await Promise.all([
+      supabaseAdmin
+        .from("team_members")
+        .select(`
+          user_id,
+          role,
+          teams (
+            name,
+            code
+          )
+        `)
+        .in("user_id", userIds),
+      supabaseAdmin.auth.admin.listUsers({ perPage: 1000 }).catch(() => ({ data: null })),
+    ]);
 
-  const teamMap = new Map<string, { team_name: string; team_role: string }>();
-  if (teamMembers) {
-    (
-      teamMembers as unknown as Array<{
-        user_id: string;
-        role?: string | null;
-        teams?:
-          | { name?: string | null; code?: string | null }
-          | Array<{ name?: string | null; code?: string | null }>
-          | null;
-      }>
-    ).forEach((tm) => {
-      const teamObj = Array.isArray(tm.teams) ? tm.teams[0] : tm.teams;
-      teamMap.set(tm.user_id, {
-        team_name: teamObj?.name || teamObj?.code || "",
-        team_role: tm.role || "",
+    const teamMembers = teamMembersRes.data;
+    const teamMap = new Map<string, { team_name: string; team_role: string }>();
+    if (teamMembers) {
+      (
+        teamMembers as unknown as Array<{
+          user_id: string;
+          role?: string | null;
+          teams?:
+            | { name?: string | null; code?: string | null }
+            | Array<{ name?: string | null; code?: string | null }>
+            | null;
+        }>
+      ).forEach((tm) => {
+        const teamObj = Array.isArray(tm.teams) ? tm.teams[0] : tm.teams;
+        teamMap.set(tm.user_id, {
+          team_name: teamObj?.name || teamObj?.code || "",
+          team_role: tm.role || "",
+        });
       });
-    });
-  }
+    }
+
+    const usernameMap = new Map<string, string>();
+    if (authUsersRes?.data?.users) {
+      for (const u of authUsersRes.data.users) {
+        if (u.user_metadata?.username) {
+          usernameMap.set(u.id, String(u.user_metadata.username));
+        }
+      }
+    }
 
     return profiles.map((p) => {
       const tm = teamMap.get(p.id);
+      const explicitUsername = usernameMap.get(p.id);
+      const fallbackUsername = p.email ? p.email.split("@")[0] : null;
       return {
         id: p.id,
         email: p.email,
@@ -226,15 +244,16 @@ export async function getUsersList(params?: {
         created_at: p.created_at,
         team_name: tm?.team_name || null,
         team_role: tm?.team_role || null,
+        username: explicitUsername || fallbackUsername,
       };
     });
   };
 
   const timeoutPromise = new Promise<UserProfileItem[]>((resolve) =>
     setTimeout(() => {
-      console.warn("getUsersList timed out after 3000ms. Returning fallback empty list.");
+      console.warn("getUsersList timed out after 8000ms. Returning fallback empty list.");
       resolve([]);
-    }, 3000)
+    }, 8000)
   );
 
   return Promise.race([fetchUsers(), timeoutPromise]);
@@ -243,8 +262,22 @@ export async function getUsersList(params?: {
 export async function updateUserRole(data: {
   userId: string;
   newRole: AllowedUserRole;
+  [CSRF_CONSTANTS.HEADER_NAME]?: string;
 }) {
   const { user } = await requireAdmin();
+  await validateCsrfToken(data[CSRF_CONSTANTS.HEADER_NAME] || null);
+
+  // Rate limiting for role changes
+  const rateLimit = checkServerActionRateLimit(
+    user.id,
+    "userRoleChange",
+    SERVER_ACTION_RATE_LIMITS.userRoleChange.maxRequests,
+    SERVER_ACTION_RATE_LIMITS.userRoleChange.windowMs
+  );
+
+  if (!rateLimit.success) {
+    throw new Error(`Too many role change attempts. Please try again in ${rateLimit.retryAfter} seconds.`);
+  }
 
   if (user.id === data.userId && data.newRole !== "admin") {
     throw new Error("Security Alert: You cannot demote your own active admin account.");
@@ -311,27 +344,44 @@ export async function createUser(data: {
   password: string;
   fullName: string;
   role: AllowedUserRole;
+  username?: string;
+  [CSRF_CONSTANTS.HEADER_NAME]?: string;
 }) {
   const { user } = await requireAdmin();
+  await validateCsrfToken(data[CSRF_CONSTANTS.HEADER_NAME] || null);
 
   if (!data.email || !data.password || !data.fullName) {
     throw new Error("Missing required user fields (email, password, full name).");
   }
 
-  if (data.password.length < 6) {
-    throw new Error("Password must be at least 6 characters.");
+  // Strong password requirements
+  if (data.password.length < 12) {
+    throw new Error("Password must be at least 12 characters.");
+  }
+  if (!/[A-Z]/.test(data.password)) {
+    throw new Error("Password must contain at least one uppercase letter.");
+  }
+  if (!/[a-z]/.test(data.password)) {
+    throw new Error("Password must contain at least one lowercase letter.");
+  }
+  if (!/[0-9]/.test(data.password)) {
+    throw new Error("Password must contain at least one number.");
+  }
+  if (!/[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]/.test(data.password)) {
+    throw new Error("Password must contain at least one special character.");
   }
 
   // 1. Create account via Supabase Admin API
-  const { data: newUser, error: createError } = await supabaseAdmin.auth.admin.createUser({
-    email: data.email,
-    password: data.password,
-    email_confirm: true,
-    user_metadata: {
-      full_name: data.fullName,
-      role: data.role,
-    },
-  });
+    const { data: newUser, error: createError } = await supabaseAdmin.auth.admin.createUser({
+      email: data.email,
+      password: data.password,
+      email_confirm: true,
+      user_metadata: {
+        full_name: data.fullName,
+        role: data.role,
+        username: data.username,
+      },
+    });
 
   if (createError || !newUser?.user) {
     throw new Error(`Failed to create user: ${createError?.message || "Unknown error"}`);
@@ -374,8 +424,9 @@ export async function createUser(data: {
   return { success: true, user: newUser.user };
 }
 
-export async function deleteUser(userId: string) {
+export async function deleteUser(userId: string, csrfToken?: string) {
   const { user } = await requireAdmin();
+  await validateCsrfToken(csrfToken || null);
 
   if (user.id === userId) {
     throw new Error("Security Alert: You cannot delete your own admin account.");
@@ -429,10 +480,24 @@ export interface BulkImportUserRecord {
   team_name?: string;
   team_code?: string;
   track?: string;
+  username?: string;
 }
 
-export async function bulkImportUsers(records: BulkImportUserRecord[]) {
+export async function bulkImportUsers(records: BulkImportUserRecord[], csrfToken?: string) {
   const { user } = await requireAdmin();
+  await validateCsrfToken(csrfToken || null);
+
+  // Rate limiting for bulk operations
+  const rateLimit = checkServerActionRateLimit(
+    user.id,
+    "bulkOperations",
+    SERVER_ACTION_RATE_LIMITS.bulkOperations.maxRequests,
+    SERVER_ACTION_RATE_LIMITS.bulkOperations.windowMs
+  );
+
+  if (!rateLimit.success) {
+    throw new Error(`Too many bulk import attempts. Please try again in ${rateLimit.retryAfter} seconds.`);
+  }
 
   if (!records || records.length === 0) {
     throw new Error("No records provided for import.");
@@ -445,18 +510,45 @@ export async function bulkImportUsers(records: BulkImportUserRecord[]) {
     errors: [] as string[],
   };
 
-  const DEFAULT_PASSWORD = "123";
+  // Generate a strong random password for users without one
+  function generateStrongPassword(): string {
+    const upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const lower = "abcdefghijklmnopqrstuvwxyz";
+    const numbers = "0123456789";
+    const special = "!@#$%^&*()_+-=[]{}|;:,.<>?";
+    const all = upper + lower + numbers + special;
+    
+    let password = "";
+    password += upper[Math.floor(Math.random() * upper.length)];
+    password += lower[Math.floor(Math.random() * lower.length)];
+    password += numbers[Math.floor(Math.random() * numbers.length)];
+    password += special[Math.floor(Math.random() * special.length)];
+    
+    for (let i = 4; i < 16; i++) {
+      password += all[Math.floor(Math.random() * all.length)];
+    }
+    
+    // Shuffle
+    return password.split("").sort(() => Math.random() - 0.5).join("");
+  }
 
   for (const item of records) {
-    const email = item.email?.trim().toLowerCase();
-    const fullName = item.full_name?.trim();
+     const rawEmail = item.email?.trim().toLowerCase();
+     const username = item.username?.trim();
+     const loginEmail = rawEmail
+       ? rawEmail
+       : username
+       ? (username.includes("@") ? username.toLowerCase() : `${username.toLowerCase()}@ivc.pulse`)
+       : null;
+     const email = loginEmail;
+     const fullName = item.full_name?.trim();
     let rawRole = item.role?.toLowerCase();
     // Security fencing: Nobody can be assigned as admin through CSV import
     if (rawRole === "admin") {
       rawRole = "participant";
     }
     const role: AllowedUserRole = (rawRole as AllowedUserRole) || "participant";
-    const password = item.password?.trim() || DEFAULT_PASSWORD;
+    const password = item.password?.trim() || generateStrongPassword();
 
     if (!email || !fullName) {
       results.errors.push(`Row skipped: missing email or full name (${JSON.stringify(item)})`);
@@ -486,7 +578,7 @@ export async function bulkImportUsers(records: BulkImportUserRecord[]) {
         if (userId) {
           try {
             await supabaseAdmin.auth.admin.updateUserById(userId, {
-              user_metadata: { full_name: fullName, role },
+               user_metadata: { full_name: fullName, role, username: item.username },
             });
           } catch {
             // Ignore metadata sync error
@@ -501,7 +593,7 @@ export async function bulkImportUsers(records: BulkImportUserRecord[]) {
             email,
             password,
             email_confirm: true,
-            user_metadata: { full_name: fullName, role },
+             user_metadata: { full_name: fullName, role, username: item.username },
           });
 
           if (createAuthErr) throw createAuthErr;

@@ -1,6 +1,9 @@
 import type { NextConfig } from "next";
 
 function getPort(): string | undefined {
+  if (process.env.NODE_ENV === "production" || process.env.VERCEL) {
+    return undefined;
+  }
   if (process.env.PORT) return process.env.PORT;
   const pIndex = process.argv.indexOf("-p");
   if (pIndex !== -1 && process.argv[pIndex + 1]) {
@@ -26,19 +29,11 @@ const nextConfig: NextConfig = {
       },
     ],
   },
-  async headers() {
-    return [
-      {
-        source: '/:all*',
-        headers: [
-          {
-            key: 'Cache-Control',
-            value: 'public, max-age=31536000, immutable',
-          },
-        ],
-      },
-    ];
+  transpilePackages: ["lucide-react"],
+  experimental: {
+    optimizePackageImports: ["lucide-react"],
   },
+  // Removed global Cache‑Control header to avoid stale chunk caching.
 };
 
 export default nextConfig;
